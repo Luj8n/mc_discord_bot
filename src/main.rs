@@ -5,8 +5,8 @@ use serenity::model::prelude::application_command::CommandDataOptionValue;
 use serenity::model::prelude::*;
 use serenity::prelude::*;
 use serenity::utils::Colour;
-use std::env;
 use std::time::Duration;
+use std::{env, io};
 use tokio::time;
 
 #[derive(Deserialize, Debug)]
@@ -41,7 +41,15 @@ struct Handler {
   server_address: String,
   status_channel_id: u64,
   verify_channel_id: u64,
-  rcon_client: Mutex<RconClient>,
+  rcon_password: String,
+}
+
+async fn create_rcon_client(rcon_password: &str) -> io::Result<RconClient> {
+  let mut rcon_client = RconClient::new("localhost", 25575).await?;
+
+  rcon_client.authenticate(rcon_password).await?;
+
+  Ok(rcon_client)
 }
 
 impl Handler {
@@ -59,23 +67,14 @@ impl Handler {
       .parse()
       .expect("Couldn't parse DISCORD_VERIFY_CHANNEL_ID");
 
-    let mut rcon_client = RconClient::new("localhost", 25575)
-      .await
-      .expect("Could't create an RCON client");
-
     let rcon_password =
       env::var("RCON_PASSWORD").expect("Expected RCON_PASSWORD in the environment variables");
-
-    rcon_client
-      .authenticate(&rcon_password)
-      .await
-      .expect("Authenticate failed. Most likely RCON_PASSWORD is incorrect");
 
     Self {
       server_address,
       status_channel_id,
       verify_channel_id,
-      rcon_client: Mutex::new(rcon_client),
+      rcon_password,
     }
   }
 }
@@ -134,42 +133,44 @@ impl EventHandler for Handler {
           if is_verified {
             "You have already verified a username, please contact an admin if you have verified the wrong username or need to change it.".to_string()
           } else {
-            let profile = get_mojang_profile(username).await;
+            match create_rcon_client(&self.rcon_password).await {
+              Err(err) => {
+                println!("- Couldn't create an rcon client: {err}");
+                "Could not connect to the minecraft server. Probably because it is offline right now. Try again later"
+                  .to_string()
+              }
+              Ok(mut rcon_client) => match get_mojang_profile(username).await {
+                Some(MojangResponse::Success { name, .. }) => {
+                  let server_response = rcon_client
+                    .run_command(&format!("whitelist add {name}"))
+                    .await
+                    .ok();
 
-            match profile {
-              Some(MojangResponse::Success { name, .. }) => {
-                let server_response = self
-                  .rcon_client
-                  .lock()
-                  .await
-                  .run_command(&format!("whitelist add {name}"))
-                  .await
-                  .ok();
+                  match server_response {
+                    Some(_) => {
+                      command
+                        .member
+                        .as_mut()
+                        .expect("There should be a user")
+                        .add_role(&ctx, verified_role)
+                        .await
+                        .expect("Couldn't add Verified role to a user");
 
-                match server_response {
-                  Some(_) => {
-                    command
-                      .member
-                      .as_mut()
-                      .expect("There should be a user")
-                      .add_role(&ctx, verified_role)
-                      .await
-                      .expect("Couldn't add Verified role to a user");
-
-                    println!("- '{name}' was successfully added to the whitelist");
-                    format!("'{name}' was successfully added to the whitelist!")
-                  }
-                  None => {
-                    "Something went wrong... The server is probably offline right now. Try again when the server is online".to_string()
+                      println!("- '{name}' was successfully added to the whitelist");
+                      format!("'{name}' was successfully added to the whitelist!")
+                    }
+                    None => {
+                      "Something went wrong... The server is probably offline right now. Try again when the server is online".to_string()
+                    }
                   }
                 }
-              }
-              Some(MojangResponse::Failure { .. }) => {
-                format!("There isn't a Mojang user with '{username}' username. Please try again.")
-              }
-              None => {
-                "Couldn't fetch the profile from the Mojang API. Please try again.".to_string()
-              }
+                Some(MojangResponse::Failure { .. }) => {
+                  format!("There isn't a Mojang user with '{username}' username. Please try again.")
+                }
+                None => {
+                  "Couldn't fetch the profile from the Mojang API. Please try again.".to_string()
+                }
+              },
             }
           }
         }
