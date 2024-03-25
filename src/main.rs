@@ -1,10 +1,7 @@
 use mc_query::rcon::RconClient;
 use serde::Deserialize;
+use serenity::all::*;
 use serenity::async_trait;
-use serenity::model::prelude::application_command::CommandDataOptionValue;
-use serenity::model::prelude::*;
-use serenity::prelude::*;
-use serenity::utils::Colour;
 use std::time::Duration;
 use std::{env, io};
 use tokio::time;
@@ -83,8 +80,8 @@ impl Handler {
 impl EventHandler for Handler {
   async fn message(&self, ctx: Context, new_message: Message) {
     // Delete all new messages that are not sent by the bot in the verify channel
-    if new_message.channel_id.0 == self.verify_channel_id
-      && new_message.author != ctx.cache.current_user().into()
+    if new_message.channel_id == self.verify_channel_id
+      && new_message.author != **ctx.cache.current_user()
     {
       new_message
         .delete(&ctx)
@@ -94,17 +91,15 @@ impl EventHandler for Handler {
   }
 
   async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-    if let Interaction::ApplicationCommand(mut command) = interaction {
+    if let Interaction::Command(mut command) = interaction {
       let content = match command.data.name.as_str() {
         "verify" => {
-          let username = command
+          let username = &command
             .data
             .options
             .first()
             .expect("There wasn't an option")
-            .resolved
-            .as_ref()
-            .expect("There wasn't a value");
+            .value;
 
           let username = match username {
             CommandDataOptionValue::String(str) => str,
@@ -113,12 +108,14 @@ impl EventHandler for Handler {
 
           let verify_channel = ctx
             .cache
-            .guild_channel(self.verify_channel_id)
-            .expect("There should be channel with the provided DISCORD_VERIFY_CHANNEL_ID");
+            .channel(self.verify_channel_id)
+            .expect("There should be channel with the provided DISCORD_VERIFY_CHANNEL_ID")
+            .clone();
 
           let guild = verify_channel
             .guild(&ctx)
-            .expect("Couldn't find channel's guild");
+            .expect("Couldn't find channel's guild")
+            .clone();
 
           let verified_role = guild
             .role_by_name("Verified")
@@ -180,9 +177,14 @@ impl EventHandler for Handler {
       };
 
       command
-        .create_interaction_response(&ctx, |response| {
-          response.interaction_response_data(|message| message.content(content).ephemeral(true))
-        })
+        .create_response(
+          &ctx,
+          CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+              .content(content)
+              .ephemeral(true),
+          ),
+        )
         .await
         .expect("Couldn't respond to a slash command");
     }
@@ -197,22 +199,25 @@ impl EventHandler for Handler {
 
     let verify_channel = ctx
       .cache
-      .guild_channel(self.verify_channel_id)
-      .expect("There should be channel with the provided DISCORD_VERIFY_CHANNEL_ID");
+      .channel(self.verify_channel_id)
+      .expect("There should be channel with the provided DISCORD_VERIFY_CHANNEL_ID")
+      .clone();
 
     let guild = verify_channel
       .guild(&ctx)
-      .expect("Couldn't find channel's guild");
+      .expect("Couldn't find channel's guild")
+      .clone();
 
     // Create a Verified role if it doesn't exist
     if guild.role_by_name("Verified").is_none() {
       guild
-        .create_role(&ctx, |role| {
-          role
+        .create_role(
+          &ctx,
+          EditRole::new()
             .name("Verified")
-            .colour(Colour::BLUE.0 as u64)
-            .hoist(true)
-        })
+            .colour(Colour::BLUE)
+            .hoist(true),
+        )
         .await
         .expect("Couldn't create a role");
       println!("- Created the Verified role");
@@ -220,22 +225,24 @@ impl EventHandler for Handler {
 
     // Send the verify info message if the channel has no messages
     if verify_channel
-      .messages(&ctx, |x| x.limit(1))
+      .messages(&ctx, GetMessages::new().limit(1))
       .await
       .expect("Couldn't get messages of verify channel")
       .is_empty()
     {
       verify_channel
-        .send_message(&ctx, |create_message| {
-          create_message.embed(|e| {
-            e.title("Verification Ready!")
+        .send_message(
+          &ctx,
+          CreateMessage::new().embed(
+            CreateEmbed::new()
+              .title("Verification Ready!")
               .description(
                 "Type `/verify <username>` to add your minecraft profile to the server whitelist.",
               )
-              .footer(|f| f.text("Minecraft Verification Bot"))
-              .colour(Colour::DARK_GREEN)
-          })
-        })
+              .footer(CreateEmbedFooter::new("Minecraft Verification Bot"))
+              .colour(Colour::DARK_GREEN),
+          ),
+        )
         .await
         .expect("Couldn't send embed");
       println!("- Sent the first verify info message");
@@ -243,25 +250,25 @@ impl EventHandler for Handler {
 
     let mut status_channel = ctx
       .cache
-      .guild_channel(self.status_channel_id)
-      .expect("There should be channel with the provided DISCORD_STATUS_CHANNEL_ID");
+      .channel(self.status_channel_id)
+      .expect("There should be channel with the provided DISCORD_STATUS_CHANNEL_ID")
+      .clone();
 
     // Add slash commands
     guild
-      .set_application_commands(&ctx, |commands| {
-        commands.create_application_command(|command| {
-          command
-            .name("verify")
-            .create_option(|option| {
-              option
-                .name("username")
-                .description("Your Minecraft username")
-                .kind(command::CommandOptionType::String)
-                .required(true)
-            })
-            .description("Verify a Minecraft username and add it to the whitelist.")
-        })
-      })
+      .create_command(
+        &ctx,
+        CreateCommand::new("verify")
+          .add_option(
+            CreateCommandOption::new(
+              CommandOptionType::String,
+              "username",
+              "Your Minecraft username",
+            )
+            .required(true),
+          )
+          .description("Verify a Minecraft username and add it to the whitelist."),
+      )
       .await
       .expect("Couldn't create commands");
 
@@ -289,7 +296,7 @@ impl EventHandler for Handler {
       if old_channel_name != new_channel_name {
         println!("- Changing channel name...");
         status_channel
-          .edit(&ctx, |x| x.name(&new_channel_name))
+          .edit(&ctx, EditChannel::new().name(&new_channel_name))
           .await
           .expect("Couldn't change the name of the channel");
         println!("- Channel name changed from '{old_channel_name}' to '{new_channel_name}'");
@@ -305,7 +312,6 @@ impl EventHandler for Handler {
 
 #[tokio::main]
 async fn main() {
-  // TODO: update serenity
   // TODO?: create a different thread for the interval channel
 
   dotenvy::dotenv().unwrap();
