@@ -39,13 +39,13 @@ async fn get_mojang_profile(username: &str) -> Option<MojangResponse> {
 
 struct Handler {
   server_address: String,
+  rcon_password: String,
   status_channel_id: u64,
   verify_channel_id: u64,
-  rcon_password: String,
 }
 
-async fn create_rcon_client(rcon_password: &str) -> io::Result<RconClient> {
-  let mut rcon_client = RconClient::new("localhost", 25575).await?;
+async fn create_rcon_client(server_address: &str, rcon_password: &str) -> io::Result<RconClient> {
+  let mut rcon_client = RconClient::new(server_address, 25575).await?;
 
   rcon_client.authenticate(rcon_password).await?;
 
@@ -57,6 +57,9 @@ impl Handler {
     let server_address =
       env::var("SERVER_ADDRESS").expect("Expected SERVER_ADDRESS in the environment variables");
 
+    let rcon_password =
+      env::var("RCON_PASSWORD").expect("Expected RCON_PASSWORD in the environment variables");
+
     let status_channel_id: u64 = env::var("DISCORD_STATUS_CHANNEL_ID")
       .expect("Expected DISCORD_STATUS_CHANNEL_ID in the environment variables")
       .parse()
@@ -67,14 +70,11 @@ impl Handler {
       .parse()
       .expect("Couldn't parse DISCORD_VERIFY_CHANNEL_ID");
 
-    let rcon_password =
-      env::var("RCON_PASSWORD").expect("Expected RCON_PASSWORD in the environment variables");
-
     Self {
       server_address,
+      rcon_password,
       status_channel_id,
       verify_channel_id,
-      rcon_password,
     }
   }
 }
@@ -133,44 +133,46 @@ impl EventHandler for Handler {
           if is_verified {
             "You have already verified a username, please contact an admin if you have verified the wrong username or need to change it.".to_string()
           } else {
-            match create_rcon_client(&self.rcon_password).await {
-              Err(err) => {
-                println!("- Couldn't create an rcon client: {err}");
-                "Could not connect to the minecraft server. Probably because it is offline right now. Try again later"
-                  .to_string()
-              }
-              Ok(mut rcon_client) => match get_mojang_profile(username).await {
-                Some(MojangResponse::Success { name, .. }) => {
-                  let server_response = rcon_client
-                    .run_command(&format!("whitelist add {name}"))
-                    .await
-                    .ok();
+            match get_mojang_profile(username).await {
+              Some(MojangResponse::Success { name, .. }) => {
+                match create_rcon_client(&self.server_address, &self.rcon_password).await {
+                  Err(err) => {
+                    println!("- Couldn't create an rcon client: {err}");
+                    "Could not connect to the minecraft server. Probably because it is offline right now. Try again later"
+                      .to_string()
+                  }
+                  Ok(mut rcon_client) => {
+                    let server_response = rcon_client
+                      .run_command(&format!("whitelist add {name}"))
+                      .await
+                      .ok();
 
-                  match server_response {
-                    Some(_) => {
-                      command
-                        .member
-                        .as_mut()
-                        .expect("There should be a user")
-                        .add_role(&ctx, verified_role)
-                        .await
-                        .expect("Couldn't add Verified role to a user");
+                    match server_response {
+                      Some(_) => {
+                        command
+                          .member
+                          .as_mut()
+                          .expect("There should be a user")
+                          .add_role(&ctx, verified_role)
+                          .await
+                          .expect("Couldn't add Verified role to a user");
 
-                      println!("- '{name}' was successfully added to the whitelist");
-                      format!("'{name}' was successfully added to the whitelist!")
-                    }
-                    None => {
-                      "Something went wrong... The server is probably offline right now. Try again when the server is online".to_string()
+                        println!("- '{name}' was successfully added to the whitelist");
+                        format!("'{name}' was successfully added to the whitelist!")
+                      }
+                      None => {
+                        "Something went wrong... The server is probably offline right now. Try again when the server is online".to_string()
+                      }
                     }
                   }
                 }
-                Some(MojangResponse::Failure { .. }) => {
-                  format!("There isn't a Mojang user with '{username}' username. Please try again.")
-                }
-                None => {
-                  "Couldn't fetch the profile from the Mojang API. Please try again.".to_string()
-                }
-              },
+              }
+              Some(MojangResponse::Failure { .. }) => {
+                format!("There isn't a Mojang user with '{username}' username. Please try again.")
+              }
+              None => {
+                "Couldn't fetch the profile from the Mojang API. Please try again.".to_string()
+              }
             }
           }
         }
