@@ -78,17 +78,17 @@ impl Handler {
 
 #[async_trait]
 impl EventHandler for Handler {
-  async fn message(&self, ctx: Context, new_message: Message) {
-    // Delete all new messages that are not sent by the bot in the verify channel
-    if new_message.channel_id == self.verify_channel_id
-      && new_message.author != **ctx.cache.current_user()
-    {
-      new_message
-        .delete(&ctx)
-        .await
-        .expect("Couldn't delete a message");
-    }
-  }
+  // async fn message(&self, ctx: Context, new_message: Message) {
+  //   // Delete all new messages that are not sent by the bot in the verify channel
+  //   if new_message.channel_id == self.verify_channel_id
+  //     && new_message.author != **ctx.cache.current_user()
+  //   {
+  //     new_message
+  //       .delete(&ctx)
+  //       .await
+  //       .expect("Couldn't delete a message");
+  //   }
+  // }
 
   async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
     if let Interaction::Command(mut command) = interaction {
@@ -106,69 +106,68 @@ impl EventHandler for Handler {
             _ => panic!("It should be a String"),
           };
 
-          let verify_channel = ctx
-            .cache
-            .channel(self.verify_channel_id)
-            .expect("There should be channel with the provided DISCORD_VERIFY_CHANNEL_ID")
-            .clone();
+          match command
+            .guild_id
+            .and_then(|guild_id| ctx.cache.guild(guild_id).map(|g| g.clone()))
+          {
+            None => "Commands only work in a specific server".to_string(),
+            Some(guild) => {
+              let verified_role = guild
+                .role_by_name("Verified")
+                .expect("There should a Verified role");
 
-          let guild = verify_channel
-            .guild(&ctx)
-            .expect("Couldn't find channel's guild")
-            .clone();
+              let is_verified = command
+                .user
+                .has_role(&ctx, guild.id, verified_role)
+                .await
+                .expect("Couldn't check if user has role");
 
-          let verified_role = guild
-            .role_by_name("Verified")
-            .expect("There should a Verified role");
-
-          let is_verified = command
-            .user
-            .has_role(&ctx, guild.id, verified_role)
-            .await
-            .expect("Couldn't check if user has role");
-
-          if is_verified {
-            "You have already verified a username, please contact an admin if you have verified the wrong username or need to change it.".to_string()
-          } else {
-            match get_mojang_profile(username).await {
-              Some(MojangResponse::Success { name, .. }) => {
-                match create_rcon_client(&self.server_address, &self.rcon_password).await {
-                  Err(err) => {
-                    println!("- Couldn't create an rcon client: {err}");
-                    "Could not connect to the minecraft server. Probably because it is offline right now. Try again later"
-                      .to_string()
-                  }
-                  Ok(mut rcon_client) => {
-                    let server_response = rcon_client
-                      .run_command(&format!("whitelist add {name}"))
-                      .await
-                      .ok();
-
-                    match server_response {
-                      Some(_) => {
-                        command
-                          .member
-                          .as_mut()
-                          .expect("There should be a user")
-                          .add_role(&ctx, verified_role)
-                          .await
-                          .expect("Couldn't add Verified role to a user");
-
-                        println!("- '{name}' was successfully added to the whitelist");
-                        format!("'{name}' was successfully added to the whitelist!")
+              if is_verified {
+                "You have already verified a username, please contact an admin if you have verified the wrong username or need to change it.".to_string()
+              } else {
+                match get_mojang_profile(username).await {
+                  Some(MojangResponse::Success { name, .. }) => {
+                    match create_rcon_client(&self.server_address, &self.rcon_password).await {
+                      Err(err) => {
+                        println!("- Couldn't create an rcon client: {err}");
+                        "Could not connect to the minecraft server. Probably because it is offline right now. Try again later"
+                          .to_string()
                       }
-                      None => {
-                        "Something went wrong... The server is probably offline right now. Try again when the server is online".to_string()
+                      Ok(mut rcon_client) => {
+                        let server_response = rcon_client
+                          .run_command(&format!("whitelist add {name}"))
+                          .await
+                          .ok();
+
+                        match server_response {
+                          Some(_) => {
+                            command
+                              .member
+                              .as_mut()
+                              .expect("There should be a user")
+                              .add_role(&ctx, verified_role)
+                              .await
+                              .expect("Couldn't add Verified role to a user");
+
+                            println!("- '{name}' was successfully added to the whitelist");
+                            format!("'{name}' was successfully added to the whitelist!")
+                          }
+                          None => {
+                            "Something went wrong... The server is probably offline right now. Try again when the server is online".to_string()
+                          }
+                        }
                       }
                     }
                   }
+                  Some(MojangResponse::Failure { .. }) => {
+                    format!(
+                      "There isn't a Mojang user with '{username}' username. Please try again."
+                    )
+                  }
+                  None => {
+                    "Couldn't fetch the profile from the Mojang API. Please try again.".to_string()
+                  }
                 }
-              }
-              Some(MojangResponse::Failure { .. }) => {
-                format!("There isn't a Mojang user with '{username}' username. Please try again.")
-              }
-              None => {
-                "Couldn't fetch the profile from the Mojang API. Please try again.".to_string()
               }
             }
           }
@@ -197,15 +196,19 @@ impl EventHandler for Handler {
     println!("- Loading everything...");
     time::sleep(Duration::from_secs(3)).await;
 
-    let verify_channel = ctx
+    let guild = ctx
       .cache
-      .channel(self.verify_channel_id)
-      .expect("There should be channel with the provided DISCORD_VERIFY_CHANNEL_ID")
-      .clone();
+      .guilds()
+      .clone()
+      .iter()
+      .filter_map(|guild_id| ctx.cache.guild(guild_id).map(|g| g.clone()))
+      .find(|guild| guild.channels.contains_key(&self.verify_channel_id.into()))
+      .expect("There should be guild with a channel with the provided DISCORD_VERIFY_CHANNEL_ID");
 
-    let guild = verify_channel
-      .guild(&ctx)
-      .expect("Couldn't find channel's guild")
+    let verify_channel = guild
+      .channels
+      .get(&self.verify_channel_id.into())
+      .expect("There should be channel with the provided DISCORD_VERIFY_CHANNEL_ID")
       .clone();
 
     // Create a Verified role if it doesn't exist
@@ -248,9 +251,9 @@ impl EventHandler for Handler {
       println!("- Sent the first verify info message");
     }
 
-    let mut status_channel = ctx
-      .cache
-      .channel(self.status_channel_id)
+    let mut status_channel = guild
+      .channels
+      .get(&self.status_channel_id.into())
       .expect("There should be channel with the provided DISCORD_STATUS_CHANNEL_ID")
       .clone();
 
@@ -272,8 +275,8 @@ impl EventHandler for Handler {
       .await
       .expect("Couldn't create commands");
 
-    // Loop every 5 minutes and update the channel name to the current player count of the minecraft server
-    let mut interval = time::interval(Duration::from_secs(5 * 60));
+    // Loop every 6 minutes and update the channel name to the current player count of the minecraft server
+    let mut interval = time::interval(Duration::from_secs(6 * 60));
 
     loop {
       interval.tick().await;
