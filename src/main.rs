@@ -36,8 +36,13 @@ async fn get_mojang_profile(username: &str) -> Option<MojangResponse> {
 
 struct Handler {
   server_address: String,
-  rcon_password: String,
+  server_port: u16,
   status_channel_id: u64,
+  whitelisting: Option<VerificationData>,
+}
+
+struct VerificationData {
+  rcon_password: String,
   verify_channel_id: u64,
 }
 
@@ -54,24 +59,118 @@ impl Handler {
     let server_address =
       env::var("SERVER_ADDRESS").expect("Expected SERVER_ADDRESS in the environment variables");
 
-    let rcon_password =
-      env::var("RCON_PASSWORD").expect("Expected RCON_PASSWORD in the environment variables");
+    let server_port: u16 = env::var("SERVER_PORT")
+      .unwrap_or_else(|_| "25565".to_string())
+      .parse()
+      .expect("Couldn't parse SERVER_PORT");
 
     let status_channel_id: u64 = env::var("DISCORD_STATUS_CHANNEL_ID")
       .expect("Expected DISCORD_STATUS_CHANNEL_ID in the environment variables")
       .parse()
       .expect("Couldn't parse DISCORD_STATUS_CHANNEL_ID");
 
-    let verify_channel_id: u64 = env::var("DISCORD_VERIFY_CHANNEL_ID")
-      .expect("Expected DISCORD_VERIFY_CHANNEL_ID in the environment variables")
-      .parse()
-      .expect("Couldn't parse DISCORD_VERIFY_CHANNEL_ID");
+    let whitelisting = if let Ok(rcon_password) = env::var("RCON_PASSWORD")
+      && let Ok(verify_channel_id) = env::var("DISCORD_VERIFY_CHANNEL_ID")
+    {
+      Some(VerificationData {
+        rcon_password,
+        verify_channel_id: verify_channel_id
+          .parse()
+          .expect("Couldn't parse DISCORD_VERIFY_CHANNEL_ID"),
+      })
+    } else {
+      println!(
+        "Whitelisting is disabled. Add RCON_PASSWORD and DISCORD_VERIFY_CHANNEL_ID to enable it"
+      );
+      None
+    };
 
     Self {
       server_address,
-      rcon_password,
+      server_port,
       status_channel_id,
-      verify_channel_id,
+      whitelisting,
+    }
+  }
+
+  async fn prepare_whitelisting(&self, ctx: &Context) {
+    if let Some(whitelisting) = &self.whitelisting {
+      let guild = ctx
+        .cache
+        .guilds()
+        .clone()
+        .iter()
+        .filter_map(|guild_id| ctx.cache.guild(guild_id).map(|g| g.clone()))
+        .find(|guild| {
+          guild
+            .channels
+            .contains_key(&whitelisting.verify_channel_id.into())
+        })
+        .expect("There should be guild with a channel with the provided DISCORD_VERIFY_CHANNEL_ID");
+
+      let verify_channel = guild
+        .channels
+        .get(&whitelisting.verify_channel_id.into())
+        .expect("There should be channel with the provided DISCORD_VERIFY_CHANNEL_ID")
+        .clone();
+
+      // Create a Verified role if it doesn't exist
+      if guild.role_by_name("Verified").is_none() {
+        guild
+          .create_role(
+            &ctx,
+            EditRole::new()
+              .name("Verified")
+              .colour(Colour::BLUE)
+              .hoist(true),
+          )
+          .await
+          .expect("Couldn't create a role");
+        println!("- Created the Verified role");
+      }
+
+      // Send the verify info message if the channel has no messages
+      if verify_channel
+        .messages(&ctx, GetMessages::new().limit(1))
+        .await
+        .expect("Couldn't get messages of verify channel")
+        .is_empty()
+      {
+        verify_channel
+  .send_message(
+    &ctx,
+    CreateMessage::new().embed(
+      CreateEmbed::new()
+      .title("Verification Ready!")
+      .description(
+        "Type `/verify <username>` to add your minecraft profile to the server whitelist.",
+      )
+      .footer(CreateEmbedFooter::new("Minecraft Verification Bot"))
+      .colour(Colour::DARK_GREEN),
+    ),
+  )
+  .await
+  .expect("Couldn't send embed");
+        println!("- Sent the first verify info message");
+      }
+
+      // Add slash commands
+      guild
+        .create_command(
+          &ctx,
+          CreateCommand::new("verify")
+            .add_option(
+              CreateCommandOption::new(
+                CommandOptionType::String,
+                "username",
+                "Your Minecraft username",
+              )
+              .required(true),
+            )
+            .description("Verify a Minecraft username and add it to the whitelist."),
+        )
+        .await
+        .expect("Couldn't create commands");
     }
   }
 }
@@ -94,6 +193,11 @@ impl EventHandler for Handler {
     if let Interaction::Command(mut command) = interaction {
       let content = match command.data.name.as_str() {
         "verify" => {
+          let whitelisting = self
+            .whitelisting
+            .as_ref()
+            .expect("Should never receive commands when whitelisting is disabled");
+
           let username = &command
             .data
             .options
@@ -127,7 +231,9 @@ impl EventHandler for Handler {
               } else {
                 match get_mojang_profile(username).await {
                   Some(MojangResponse::Success { name, .. }) => {
-                    match create_rcon_client(&self.server_address, &self.rcon_password).await {
+                    match create_rcon_client(&self.server_address, &whitelisting.rcon_password)
+                      .await
+                    {
                       Err(err) => {
                         println!("- Couldn't create an rcon client: {err}");
                         "Could not connect to the minecraft server. Probably because it is offline right now. Try again later"
@@ -196,60 +302,16 @@ impl EventHandler for Handler {
     println!("- Loading everything...");
     time::sleep(Duration::from_secs(3)).await;
 
+    self.prepare_whitelisting(&ctx).await;
+
     let guild = ctx
       .cache
       .guilds()
       .clone()
       .iter()
       .filter_map(|guild_id| ctx.cache.guild(guild_id).map(|g| g.clone()))
-      .find(|guild| guild.channels.contains_key(&self.verify_channel_id.into()))
+      .find(|guild| guild.channels.contains_key(&self.status_channel_id.into()))
       .expect("There should be guild with a channel with the provided DISCORD_VERIFY_CHANNEL_ID");
-
-    let verify_channel = guild
-      .channels
-      .get(&self.verify_channel_id.into())
-      .expect("There should be channel with the provided DISCORD_VERIFY_CHANNEL_ID")
-      .clone();
-
-    // Create a Verified role if it doesn't exist
-    if guild.role_by_name("Verified").is_none() {
-      guild
-        .create_role(
-          &ctx,
-          EditRole::new()
-            .name("Verified")
-            .colour(Colour::BLUE)
-            .hoist(true),
-        )
-        .await
-        .expect("Couldn't create a role");
-      println!("- Created the Verified role");
-    }
-
-    // Send the verify info message if the channel has no messages
-    if verify_channel
-      .messages(&ctx, GetMessages::new().limit(1))
-      .await
-      .expect("Couldn't get messages of verify channel")
-      .is_empty()
-    {
-      verify_channel
-        .send_message(
-          &ctx,
-          CreateMessage::new().embed(
-            CreateEmbed::new()
-              .title("Verification Ready!")
-              .description(
-                "Type `/verify <username>` to add your minecraft profile to the server whitelist.",
-              )
-              .footer(CreateEmbedFooter::new("Minecraft Verification Bot"))
-              .colour(Colour::DARK_GREEN),
-          ),
-        )
-        .await
-        .expect("Couldn't send embed");
-      println!("- Sent the first verify info message");
-    }
 
     let mut status_channel = guild
       .channels
@@ -257,31 +319,13 @@ impl EventHandler for Handler {
       .expect("There should be channel with the provided DISCORD_STATUS_CHANNEL_ID")
       .clone();
 
-    // Add slash commands
-    guild
-      .create_command(
-        &ctx,
-        CreateCommand::new("verify")
-          .add_option(
-            CreateCommandOption::new(
-              CommandOptionType::String,
-              "username",
-              "Your Minecraft username",
-            )
-            .required(true),
-          )
-          .description("Verify a Minecraft username and add it to the whitelist."),
-      )
-      .await
-      .expect("Couldn't create commands");
-
     // Loop every 6 minutes and update the channel name to the current player count of the minecraft server
     let mut interval = time::interval(Duration::from_secs(6 * 60));
 
     loop {
       interval.tick().await;
 
-      let status = mc_query::status(&self.server_address, 25565).await;
+      let status = mc_query::status(&self.server_address, self.server_port).await;
 
       let new_channel_name = match status {
         Ok(status) => {
@@ -298,6 +342,7 @@ impl EventHandler for Handler {
       // Only change the channel name if the the new channel name will be different
       if old_channel_name != new_channel_name {
         println!("- Changing channel name...");
+
         status_channel
           .edit(&ctx, EditChannel::new().name(&new_channel_name))
           .await
